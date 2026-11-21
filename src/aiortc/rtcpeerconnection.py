@@ -107,8 +107,24 @@ def find_common_codecs(
     local_codecs: list[RTCRtpCodecParameters],
     remote_codecs: list[RTCRtpCodecParameters],
 ) -> list[RTCRtpCodecParameters]:
+    """
+    Return codecs from `local_codecs` that are compatible with one of the
+    `remote_codecs`, along with any corresponding remote RTX codecs.
+
+    The returned codecs have their `payloadType` corresponding to the remote codec.
+    """
     common = []
     common_base: dict[int, RTCRtpCodecParameters] = {}
+
+    for c in filter(lambda x: not is_rtx(x), remote_codecs):
+        if codec := next((x for x in local_codecs if is_codec_compatible(x, c)), None):
+            base_payload_type = (
+                c.payloadType
+                if c.payloadType in rtp.DYNAMIC_PAYLOAD_TYPES
+                else codec.payloadType
+            )
+            common_base[base_payload_type] = codec
+
     for c in remote_codecs:
         # for RTX, check we accepted the base codec
         if is_rtx(c):
@@ -129,7 +145,6 @@ def find_common_codecs(
                     filter(lambda x: x in c.rtcpFeedback, codec.rtcpFeedback)
                 )
                 common.append(codec)
-                common_base[codec.payloadType] = codec
                 break
     return common
 
@@ -1278,23 +1293,19 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             rtcp=media.rtp.rtcp,
         )
         if len(media.ssrc):
-            encodings: dict[int, RTCRtpDecodingParameters] = {}
-            for codec in transceiver._codecs:
-                if is_rtx(codec):
-                    apt = codec.parameters.get("apt")
-                    if (
-                        isinstance(apt, int)
-                        and apt in encodings
-                        and len(media.ssrc) == 2
-                    ):
-                        encodings[apt].rtx = RTCRtpRtxParameters(
-                            ssrc=media.ssrc[1].ssrc
-                        )
-                    continue
-
-                encodings[codec.payloadType] = RTCRtpDecodingParameters(
+            encodings = {
+                codec.payloadType: RTCRtpDecodingParameters(
                     ssrc=media.ssrc[0].ssrc, payloadType=codec.payloadType
                 )
+                for codec in transceiver._codecs
+                if not is_rtx(codec)
+            }
+
+            for codec in filter(is_rtx, transceiver._codecs):
+                apt = codec.parameters.get("apt")
+                if isinstance(apt, int) and apt in encodings and len(media.ssrc) == 2:
+                    encodings[apt].rtx = RTCRtpRtxParameters(ssrc=media.ssrc[1].ssrc)
+
             receiveParameters.encodings = list(encodings.values())
         return receiveParameters
 

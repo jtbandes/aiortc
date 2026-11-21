@@ -4,6 +4,7 @@ import re
 from collections.abc import Callable
 from typing import Any, Optional, Union
 from unittest import TestCase
+from unittest.mock import AsyncMock, patch
 
 import aioice.stun
 from aiortc import (
@@ -32,6 +33,7 @@ from aiortc.rtcrtpparameters import (
     RTCRtcpFeedback,
     RTCRtpCodecCapability,
     RTCRtpCodecParameters,
+    RTCRtpReceiveParameters,
 )
 from aiortc.rtcrtpsender import RTCRtpSender
 from aiortc.sdp import SessionDescription
@@ -67,6 +69,15 @@ a=rtcp-fb:97 nack pli
 a=rtcp-fb:97 goog-remb
 a=rtpmap:98 rtx/90000
 a=fmtp:98 apt=97
+"""
+)
+VP8_SDP_RTX_FIRST = lf2crlf(
+    """a=rtpmap:98 rtx/90000
+a=fmtp:98 apt=97
+a=rtpmap:97 VP8/90000
+a=rtcp-fb:97 nack
+a=rtcp-fb:97 nack pli
+a=rtcp-fb:97 goog-remb
 """
 )
 
@@ -274,6 +285,58 @@ class RTCRtpCodecParametersTest(TestCase):
                     clockRate=90000,
                     payloadType=97,
                     parameters={"apt": 96},
+                ),
+            ],
+        )
+
+    def test_find_common_codecs_rtx_out_of_order(self) -> None:
+        """
+        Test that RTX codecs are still handled if they appear before the corresponding
+        base codec.
+        """
+        local_codecs = [
+            RTCRtpCodecParameters(
+                mimeType="video/VP8", clockRate=90000, payloadType=100
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=101,
+                parameters={"apt": 100},
+            ),
+        ]
+        remote_codecs = [
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=97,
+                parameters={"apt": 96},
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/rtx",
+                clockRate=90000,
+                payloadType=99,
+                parameters={"apt": 98},
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/VP9", clockRate=90000, payloadType=98
+            ),
+            RTCRtpCodecParameters(
+                mimeType="video/VP8", clockRate=90000, payloadType=96
+            ),
+        ]
+        common = find_common_codecs(local_codecs, remote_codecs)
+        self.assertEqual(
+            common,
+            [
+                RTCRtpCodecParameters(
+                    mimeType="video/rtx",
+                    clockRate=90000,
+                    payloadType=97,
+                    parameters={"apt": 96},
+                ),
+                RTCRtpCodecParameters(
+                    mimeType="video/VP8", clockRate=90000, payloadType=96
                 ),
             ],
         )
@@ -2987,6 +3050,131 @@ a=rtpmap:8 PCMA/8000
         )
 
     @asynctest
+    async def test_connect_video_vp8_rtx_first(self) -> None:
+        """
+        Test that RTX codecs are still handled if they appear before the corresponding
+        base codec.
+        """
+        pc1 = RTCPeerConnection()
+        pc1_states = track_states(pc1)
+
+        pc2 = RTCPeerConnection()
+        pc2_states = track_states(pc2)
+
+        self.assertEqual(pc1.iceConnectionState, "new")
+        self.assertEqual(pc1.iceGatheringState, "new")
+        self.assertIsNone(pc1.localDescription)
+        self.assertIsNone(pc1.remoteDescription)
+
+        self.assertEqual(pc2.iceConnectionState, "new")
+        self.assertEqual(pc2.iceGatheringState, "new")
+        self.assertIsNone(pc2.localDescription)
+        self.assertIsNone(pc2.remoteDescription)
+
+        # create offer
+        pc1.addTrack(VideoStreamTrack())
+        offer = await pc1.createOffer()
+        self.assertEqual(offer.type, "offer")
+        self.assertTrue("m=video " in offer.sdp)
+        self.assertFalse("a=candidate:" in offer.sdp)
+        self.assertFalse("a=end-of-candidates" in offer.sdp)
+
+        await pc1.setLocalDescription(offer)
+        self.assertEqual(pc1.iceConnectionState, "new")
+        self.assertEqual(pc1.iceGatheringState, "complete")
+        self.assertEqual(mids(pc1), ["0"])
+        self.assertTrue("m=video " in pc1.localDescription.sdp)
+        self.assertTrue("a=sendrecv" in pc1.localDescription.sdp)
+        self.assertHasIceCandidates(pc1.localDescription)
+        self.assertHasDtls(pc1.localDescription, "actpass")
+
+        # keep only vp8
+        parsed = SessionDescription.parse(pc1.localDescription.sdp)
+        parsed.media[0].rtp.codecs[:] = reversed(parsed.media[0].rtp.codecs[:2])
+        parsed.media[0].fmt[:] = reversed(parsed.media[0].fmt[:2])
+        desc1 = RTCSessionDescription(sdp=str(parsed), type=pc1.localDescription.type)
+        self.assertCodecNames(desc1, ["rtx", "VP8"])
+
+        # handle offer
+        await pc2.setRemoteDescription(desc1)
+        self.assertEqual(pc2.remoteDescription, desc1)
+        self.assertEqual(len(pc2.getReceivers()), 1)
+        self.assertEqual(len(pc2.getSenders()), 1)
+        self.assertEqual(len(pc2.getTransceivers()), 1)
+        self.assertEqual(mids(pc2), ["0"])
+
+        receiver = pc2.getReceivers()[0]
+        patched_receive = AsyncMock(wraps=receiver.receive)
+        patcher = patch.object(receiver, "receive", patched_receive)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        # create answer
+        pc2.addTrack(VideoStreamTrack())
+        answer = await pc2.createAnswer()
+        self.assertEqual(answer.type, "answer")
+        self.assertTrue("m=video " in answer.sdp)
+        self.assertFalse("a=candidate:" in answer.sdp)
+        self.assertFalse("a=end-of-candidates" in answer.sdp)
+
+        await pc2.setLocalDescription(answer)
+        await self.assertIceChecking(pc2)
+        self.assertTrue("m=video " in pc2.localDescription.sdp)
+        self.assertTrue("a=sendrecv" in pc2.localDescription.sdp)
+        self.assertHasIceCandidates(pc2.localDescription)
+        self.assertHasDtls(pc2.localDescription, "active")
+        self.assertCodecNames(pc2.localDescription, ["rtx", "VP8"])
+
+        # handle answer
+        await pc1.setRemoteDescription(pc2.localDescription)
+        self.assertEqual(pc1.remoteDescription, pc2.localDescription)
+
+        # check outcome
+        await self.assertIceCompleted(pc1, pc2)
+
+        # ensure RTX parameters are passed through to receiver
+        patched_receive.assert_awaited()
+        receive_params: RTCRtpReceiveParameters = patched_receive.await_args.args[0]
+        self.assertEqual(len(receive_params.encodings), 1)
+        self.assertEqual(receive_params.encodings[0].payloadType, 97)
+        self.assertIsNotNone(receive_params.encodings[0].rtx)
+
+        # close
+        await pc1.close()
+        await pc2.close()
+        self.assertClosed(pc1)
+        self.assertClosed(pc2)
+
+        # check state changes
+        self.assertEqual(
+            pc1_states["connectionState"], ["new", "connecting", "connected", "closed"]
+        )
+        self.assertEqual(
+            pc1_states["iceConnectionState"], ["new", "checking", "completed", "closed"]
+        )
+        self.assertEqual(
+            pc1_states["iceGatheringState"], ["new", "gathering", "complete"]
+        )
+        self.assertEqual(
+            pc1_states["signalingState"],
+            ["stable", "have-local-offer", "stable", "closed"],
+        )
+
+        self.assertEqual(
+            pc2_states["connectionState"], ["new", "connecting", "connected", "closed"]
+        )
+        self.assertEqual(
+            pc2_states["iceConnectionState"], ["new", "checking", "completed", "closed"]
+        )
+        self.assertEqual(
+            pc2_states["iceGatheringState"], ["new", "gathering", "complete"]
+        )
+        self.assertEqual(
+            pc2_states["signalingState"],
+            ["stable", "have-remote-offer", "stable", "closed"],
+        )
+
+    @asynctest
     async def test_connect_video_no_ssrc(self) -> None:
         pc1 = RTCPeerConnection()
         pc1_states = track_states(pc1)
@@ -5332,7 +5520,7 @@ a=rtpmap:8 PCMA/8000
         # check outcome
         await self.assertIceCompleted(pc1, pc2)
 
-        # pc1 is explicity passive so server.
+        # pc1 is explicitly passive so server.
         self.assertEqual(pc1.sctp.transport._role, "server")
         self.assertEqual(pc2.sctp.transport._role, "client")
         # close
@@ -5397,7 +5585,7 @@ a=rtpmap:8 PCMA/8000
         # check outcome
         await self.assertIceCompleted(pc1, pc2)
 
-        # pc1 is explicity active so client.
+        # pc1 is explicitly active so client.
         self.assertEqual(pc1.sctp.transport._role, "client")
         self.assertEqual(pc2.sctp.transport._role, "server")
         # close
